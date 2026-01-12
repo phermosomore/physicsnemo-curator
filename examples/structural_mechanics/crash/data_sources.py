@@ -25,8 +25,10 @@ import zarr
 from crash_data_processors import (
     compute_node_thickness,
     find_k_file,
+    find_rad_file,  # <--- Added
     load_d3plot_data,
     parse_k_file,
+    parse_rad_file, # <--- Added
 )
 from schemas import CrashExtractedDataInMemory, CrashMetadata
 from zarr.storage import LocalStore
@@ -64,7 +66,7 @@ class CrashD3PlotDataSource(DataSource):
         return sorted(run_folders)
 
     def read_file(self, run_id: str) -> CrashExtractedDataInMemory:
-        """Read d3plot and .k file for one simulation run.
+        """Read d3plot and .k (or .rad) file for one simulation run.
 
         Returns CrashExtractedDataInMemory object.
         """
@@ -72,32 +74,42 @@ class CrashD3PlotDataSource(DataSource):
         d3plot_path = run_dir / "d3plot"
 
         self.logger.info(f"Reading {d3plot_path}")
-
         coords, pos_raw, mesh_connectivity, part_ids, actual_part_ids = (
             load_d3plot_data(str(d3plot_path))
         )
 
-        # Parse .k file for thickness
-        k_file_path = find_k_file(run_dir=run_dir)
+        # Initialize defaults
         node_thickness = np.zeros(len(coords))
+
+        # Find metadata files
+        k_file_path = find_k_file(run_dir=run_dir)
+        rad_file_path = None
+        if not k_file_path:
+            rad_file_path = find_rad_file(run_dir=run_dir)
+
+        # Parse Thickness Map
+        part_thickness_map = {}
         if k_file_path:
-            self.logger.info(f"Parsing thickness from {k_file_path}")
+            self.logger.info(f"Parsing thickness from LS-DYNA .k: {k_file_path}")
             part_thickness_map = parse_k_file(k_file_path=k_file_path)
+        elif rad_file_path:
+            self.logger.info(f"Parsing thickness from OpenRadioss .rad: {rad_file_path}")
+            part_thickness_map = parse_rad_file(rad_file_path=rad_file_path)
+        else:
+            self.logger.warning(f"No thickness file found in {run_dir}")
+
+        # Compute (Only if we have a map)
+        if part_thickness_map:
             node_thickness = compute_node_thickness(
                 mesh_connectivity=mesh_connectivity,
                 part_ids=part_ids,
                 part_thickness_map=part_thickness_map,
                 actual_part_ids=actual_part_ids,
-            )
-        else:
-            self.logger.warning(
-                f"No .k file found in {run_dir}, defaulting thickness=0"
+                num_nodes=len(coords),  # <--- PASS THIS to prevent size mismatch
             )
 
         return CrashExtractedDataInMemory(
-            metadata=CrashMetadata(
-                filename=run_id,
-            ),
+            metadata=CrashMetadata(filename=run_id),
             pos_raw=pos_raw,
             mesh_connectivity=mesh_connectivity,
             node_thickness=node_thickness,
