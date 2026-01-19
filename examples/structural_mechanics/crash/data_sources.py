@@ -14,10 +14,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 import warnings
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pyvista as pv
@@ -25,10 +26,10 @@ import zarr
 from crash_data_processors import (
     compute_node_thickness,
     find_k_file,
-    find_rad_file,  # <--- Added
+    find_rad_file,
     load_d3plot_data,
     parse_k_file,
-    parse_rad_file, # <--- Added
+    parse_rad_file,
 )
 from schemas import CrashExtractedDataInMemory, CrashMetadata
 from zarr.storage import LocalStore
@@ -44,9 +45,20 @@ class CrashD3PlotDataSource(DataSource):
         self,
         cfg: ProcessingConfig,
         input_dir: str,
+        boundary_condition_keys: Optional[List[str]] = None,
     ):
+        """Initialize the D3plot data source.
+
+        Args:
+            cfg: Processing configuration.
+            input_dir: Directory containing run folders with d3plot files.
+            boundary_condition_keys: List of parameter keys to extract from run JSON files
+                as boundary conditions (e.g., ["velocity_vector", "rwall_diameter", "rwall_origin"]).
+                If None, no boundary conditions are extracted.
+        """
         super().__init__(cfg)
         self.input_dir = Path(input_dir)
+        self.boundary_condition_keys = boundary_condition_keys or []
         self.logger = logging.getLogger(__name__)
 
         if not self.input_dir.exists():
@@ -66,7 +78,7 @@ class CrashD3PlotDataSource(DataSource):
         return sorted(run_folders)
 
     def read_file(self, run_id: str) -> CrashExtractedDataInMemory:
-        """Read d3plot and .k (or .rad) file for one simulation run.
+        """Read d3plot, .k/.rad file, and JSON boundary conditions for one simulation run.
 
         Returns CrashExtractedDataInMemory object.
         """
@@ -93,7 +105,9 @@ class CrashD3PlotDataSource(DataSource):
             self.logger.info(f"Parsing thickness from LS-DYNA .k: {k_file_path}")
             part_thickness_map = parse_k_file(k_file_path=k_file_path)
         elif rad_file_path:
-            self.logger.info(f"Parsing thickness from OpenRadioss .rad: {rad_file_path}")
+            self.logger.info(
+                f"Parsing thickness from OpenRadioss .rad: {rad_file_path}"
+            )
             part_thickness_map = parse_rad_file(rad_file_path=rad_file_path)
         else:
             self.logger.warning(f"No thickness file found in {run_dir}")
@@ -105,15 +119,72 @@ class CrashD3PlotDataSource(DataSource):
                 part_ids=part_ids,
                 part_thickness_map=part_thickness_map,
                 actual_part_ids=actual_part_ids,
-                num_nodes=len(coords),  # <--- PASS THIS to prevent size mismatch
+                num_nodes=len(coords),
             )
 
+        # Read boundary conditions from JSON file
+        boundary_conditions = self._read_boundary_conditions(run_dir, run_id)
+
         return CrashExtractedDataInMemory(
-            metadata=CrashMetadata(filename=run_id),
+            metadata=CrashMetadata(
+                filename=run_id,
+                boundary_conditions=boundary_conditions,
+            ),
             pos_raw=pos_raw,
             mesh_connectivity=mesh_connectivity,
             node_thickness=node_thickness,
         )
+
+    def _read_boundary_conditions(self, run_dir: Path, run_id: str) -> Dict[str, Any]:
+        """Read boundary conditions from the run's JSON file.
+
+        Looks for a JSON file named {run_id}.json in the run directory.
+
+        Args:
+            run_dir: Path to the run directory.
+            run_id: Run identifier (e.g., "run1").
+
+        Returns:
+            Dictionary of boundary condition values for the configured keys.
+        """
+        if not self.boundary_condition_keys:
+            return {}
+
+        # Look for {run_id}.json in the run directory
+        json_path = run_dir / f"{run_id}.json"
+
+        if not json_path.exists():
+            self.logger.warning(
+                f"No JSON file found at {json_path} for boundary conditions"
+            )
+            return {}
+
+        try:
+            with open(json_path, "r") as f:
+                run_data = json.load(f)
+        except (json.JSONDecodeError, IOError) as e:
+            self.logger.error(f"Failed to read JSON file {json_path}: {e}")
+            return {}
+
+        # Extract parameters section
+        parameters = run_data.get("parameters", {})
+
+        # Extract only the requested boundary condition keys
+        boundary_conditions = {}
+        for key in self.boundary_condition_keys:
+            if key in parameters:
+                boundary_conditions[key] = parameters[key]
+            else:
+                self.logger.warning(
+                    f"Boundary condition key '{key}' not found in {json_path}"
+                )
+
+        self.logger.info(
+            f"Loaded {len(boundary_conditions)} boundary conditions from {json_path}: "
+            f"{list(boundary_conditions.keys())}"
+        )
+
+        return boundary_conditions
 
     def _get_output_path(self, filename: str) -> Path:
         """Not implemented - this source only reads."""
@@ -203,6 +274,7 @@ class CrashVTPDataSource(DataSource):
         - poly.points = reference coordinates (t=0)
         - poly.point_data['displacement_t{time}'] = displacement at each timestep
         - poly.point_data['thickness'] = node thickness values
+        - poly.field_data['bc_{key}'] = boundary condition values (scalars or arrays)
 
         Args:
             data: Transformed crash data containing filtered_pos_raw,
@@ -252,6 +324,23 @@ class CrashVTPDataSource(DataSource):
             field_name = f"displacement_{time_str}"
 
             mesh.point_data[field_name] = displacement
+
+        # Add boundary conditions as field data (global metadata)
+        if data.metadata.boundary_conditions:
+            for key, value in data.metadata.boundary_conditions.items():
+                field_name = f"bc_{key}"
+                # Convert to numpy array for VTP compatibility
+                if isinstance(value, (list, tuple)):
+                    mesh.field_data[field_name] = np.array(value, dtype=np.float64)
+                elif isinstance(value, (int, float)):
+                    mesh.field_data[field_name] = np.array([value], dtype=np.float64)
+                else:
+                    self.logger.warning(
+                        f"Skipping boundary condition '{key}' with unsupported type: {type(value)}"
+                    )
+            self.logger.info(
+                f"Added {len(data.metadata.boundary_conditions)} boundary conditions to VTP"
+            )
 
         # Save the single VTP file
         mesh.save(output_path)
@@ -429,6 +518,7 @@ class CrashZarrDataSource(DataSource):
                 - filtered_mesh_connectivity: list of cell connectivities
                 - filtered_node_thickness: (nodes,) thickness values
                 - edges: (num_edges, 2) edge connectivity
+                - metadata.boundary_conditions: dict of boundary condition values
             output_path: TEMPORARY directory path for the Zarr store.
                         Base class will rename this to final path after writing completes.
         """
@@ -488,6 +578,37 @@ class CrashZarrDataSource(DataSource):
         root.attrs["thickness_min"] = float(np.min(data.filtered_node_thickness))
         root.attrs["thickness_max"] = float(np.max(data.filtered_node_thickness))
         root.attrs["thickness_mean"] = float(np.mean(data.filtered_node_thickness))
+
+        # Write boundary conditions as both attributes and arrays
+        if data.metadata.boundary_conditions:
+            # Create a boundary_conditions group for organized access
+            bc_group = root.create_group("boundary_conditions")
+
+            for key, value in data.metadata.boundary_conditions.items():
+                # Store as attribute (for quick access to metadata)
+                root.attrs[f"bc_{key}"] = value
+
+                # Also store as array in the boundary_conditions group
+                # This allows consistent array-based access in training
+                if isinstance(value, (list, tuple)):
+                    bc_array = np.array(value, dtype=np.float64)
+                elif isinstance(value, (int, float)):
+                    bc_array = np.array([value], dtype=np.float64)
+                else:
+                    self.logger.warning(
+                        f"Skipping boundary condition '{key}' with unsupported type: {type(value)}"
+                    )
+                    continue
+
+                bc_group.create_array(
+                    name=key,
+                    data=bc_array,
+                    chunks=bc_array.shape,  # Small arrays, no chunking needed
+                )
+
+            self.logger.info(
+                f"Added {len(data.metadata.boundary_conditions)} boundary conditions to Zarr"
+            )
 
         self.logger.info(
             f"Successfully created Zarr store with {num_timesteps} timesteps, "

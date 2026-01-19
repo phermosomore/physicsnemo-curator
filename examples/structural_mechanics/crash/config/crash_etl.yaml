@@ -26,11 +26,17 @@ etl:
     _target_: data_sources.CrashD3PlotDataSource
     _convert_: all
     input_dir: ???
+    # Boundary condition keys to extract from {run_id}.json files
+    # These are stored in the output files and available for training
+    boundary_condition_keys:
+      - velocity_vector    # Impact velocity [vx, vy, vz]
+      - rwall_diameter     # Rigid wall cylinder diameter
+      - rwall_origin       # Rigid wall origin position [x, y, z]
 
   transformations:
     crash_transform:
       _target_: data_transformations.CrashDataTransformation
       _convert_: all
-      wall_threshold: 1.0
+      wall_threshold: 1.0 # Rigid Wall (i.e.impactor) diameter and origin position changes accross simulations. But these will be encoded as Boundary Conditions.
 
   sink: ${serialization_format.sink}

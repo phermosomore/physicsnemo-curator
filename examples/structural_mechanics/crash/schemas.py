@@ -14,7 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any, Dict
 
 import numpy as np
 
@@ -25,10 +26,15 @@ class CrashMetadata:
 
     Version history:
     - 1.0: Initial version with expected metadata fields.
+    - 1.1: Added boundary_conditions for simulation parameters (velocity, wall geometry, etc.)
     """
 
     # Simulation identifiers
     filename: str
+
+    # Boundary conditions extracted from run JSON file
+    # Keys are configurable (e.g., velocity_vector, rwall_diameter, rwall_origin)
+    boundary_conditions: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -37,6 +43,7 @@ class CrashExtractedDataInMemory:
 
     Version history:
     - 1.0: Initial version with expected data fields.
+    - 1.1: Added boundary_conditions support via metadata.
     """
 
     # Metadata

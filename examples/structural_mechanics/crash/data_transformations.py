@@ -33,11 +33,23 @@ class CrashDataTransformation(DataTransformation):
         self,
         cfg: ProcessingConfig,
         wall_threshold: float = 1.0,
+        compact_orphan_nodes: bool = True,
         crash_processors: Optional[tuple[Callable, ...]] = None,
     ):
+        """Initialize the crash data transformation.
+
+        Args:
+            cfg: Processing configuration.
+            wall_threshold: Max displacement below which a node is considered "wall".
+            compact_orphan_nodes: If True, remove nodes not referenced by any mesh cell
+                and reindex to contiguous 0..N-1. If False (default), preserve all nodes
+                including unconnected ones (e.g., wall/contact surface nodes).
+            crash_processors: Optional tuple of additional processor functions.
+        """
         super().__init__(cfg)
         self.logger = logging.getLogger(__name__)
         self.wall_threshold = wall_threshold
+        self.compact_orphan_nodes = compact_orphan_nodes
         self.crash_processors = crash_processors
 
     def transform(
@@ -50,8 +62,8 @@ class CrashDataTransformation(DataTransformation):
         1. Identify wall nodes (low displacement)
         2. Filter arrays
         3. Remap mesh connectivity
-        4. Compact to only nodes that are actually used by any cell
-        5. If not contiguous 0..(num_kept-1), compact and reindex everything
+        4. Verify cells remain after filtering
+        5. Optionally compact orphan nodes (if compact_orphan_nodes=True)
         6. Build edges
 
         Returns dict with:
@@ -84,24 +96,31 @@ class CrashDataTransformation(DataTransformation):
             if len(filtered_cell) >= 3:
                 filtered_mesh_connectivity.append(filtered_cell)
 
-        # Step 4: Compact to contiguous indices (reuse your logic)
+        # Step 4: Verify we have cells remaining
         used = np.unique(
             np.array([i for cell in filtered_mesh_connectivity for i in cell])
         )
         if used.size == 0:
             raise ValueError("No cells left after filtering")
 
-        # Step 5: If not contiguous 0..(num_kept-1), compact and reindex everything
-        num_kept = filtered_pos_raw.shape[1]
-        if (used.min() != 0) or (used.max() != num_kept - 1) or (used.size != num_kept):
-            keep2 = used.tolist()
-            remap2 = {old_idx: new_idx for new_idx, old_idx in enumerate(keep2)}
-            filtered_pos_raw = filtered_pos_raw[:, keep2, :]
-            filtered_node_thickness = filtered_node_thickness[keep2]
-            filtered_mesh_connectivity = [
-                [remap2[n] for n in cell] for cell in filtered_mesh_connectivity
-            ]
+        # Step 5: Optionally compact to contiguous indices
+        # When compact_orphan_nodes=True, removes nodes not referenced by any cell
+        # When compact_orphan_nodes=False, preserves all nodes (e.g., wall/contact nodes)
+        if self.compact_orphan_nodes:
             num_kept = filtered_pos_raw.shape[1]
+            if (
+                (used.min() != 0)
+                or (used.max() != num_kept - 1)
+                or (used.size != num_kept)
+            ):
+                keep2 = used.tolist()
+                remap2 = {old_idx: new_idx for new_idx, old_idx in enumerate(keep2)}
+                filtered_pos_raw = filtered_pos_raw[:, keep2, :]
+                filtered_node_thickness = filtered_node_thickness[keep2]
+                filtered_mesh_connectivity = [
+                    [remap2[n] for n in cell] for cell in filtered_mesh_connectivity
+                ]
+                self.logger.info(f"Compacted {num_kept - len(keep2)} orphan nodes")
 
         # Step 6: Build edges
         edges = build_edges_from_mesh_connectivity(filtered_mesh_connectivity)
