@@ -44,6 +44,7 @@ class CrashExtractedDataInMemory:
     Version history:
     - 1.0: Initial version with expected data fields.
     - 1.1: Added boundary_conditions support via metadata.
+    - 1.2: Added plastic_strain and von_mises_stress fields for material response data.
     """
 
     # Metadata
@@ -53,9 +54,17 @@ class CrashExtractedDataInMemory:
     pos_raw: np.ndarray = None
     mesh_connectivity: np.ndarray = None
     node_thickness: np.ndarray = None
+    node_plastic_strain: np.ndarray = None  # Shape: (timesteps, num_nodes) or None
+    node_von_mises_stress: np.ndarray = None  # Shape: (timesteps, num_nodes) or None
 
     # Processed data
     filtered_pos_raw: np.ndarray = None
     filtered_mesh_connectivity: np.ndarray = None
     filtered_node_thickness: np.ndarray = None
+    filtered_plastic_strain: np.ndarray = (
+        None  # Shape: (timesteps, num_nodes_filtered) or None
+    )
+    filtered_von_mises_stress: np.ndarray = (
+        None  # Shape: (timesteps, num_nodes_filtered) or None
+    )
     edges: np.ndarray = None

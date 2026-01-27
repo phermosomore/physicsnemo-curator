@@ -86,9 +86,32 @@ class CrashD3PlotDataSource(DataSource):
         d3plot_path = run_dir / "d3plot"
 
         self.logger.info(f"Reading {d3plot_path}")
-        coords, pos_raw, mesh_connectivity, part_ids, actual_part_ids = (
-            load_d3plot_data(str(d3plot_path))
-        )
+        (
+            coords,
+            pos_raw,
+            mesh_connectivity,
+            part_ids,
+            actual_part_ids,
+            plastic_strain,
+            von_mises_stress,
+        ) = load_d3plot_data(str(d3plot_path))
+
+        # Log availability of material response fields
+        if plastic_strain is not None:
+            self.logger.info(
+                f"  Loaded plastic strain: {plastic_strain.shape} "
+                f"(range: [{plastic_strain.min():.6f}, {plastic_strain.max():.6f}])"
+            )
+        else:
+            self.logger.warning("  Plastic strain not available in d3plot")
+
+        if von_mises_stress is not None:
+            self.logger.info(
+                f"  Loaded von Mises stress: {von_mises_stress.shape} "
+                f"(range: [{von_mises_stress.min():.2f}, {von_mises_stress.max():.2f}] MPa)"
+            )
+        else:
+            self.logger.warning("  Von Mises stress not available in d3plot")
 
         # Initialize defaults
         node_thickness = np.zeros(len(coords))
@@ -133,6 +156,8 @@ class CrashD3PlotDataSource(DataSource):
             pos_raw=pos_raw,
             mesh_connectivity=mesh_connectivity,
             node_thickness=node_thickness,
+            node_plastic_strain=plastic_strain,
+            node_von_mises_stress=von_mises_stress,
         )
 
     def _read_boundary_conditions(self, run_dir: Path, run_id: str) -> Dict[str, Any]:
@@ -324,6 +349,44 @@ class CrashVTPDataSource(DataSource):
             field_name = f"displacement_{time_str}"
 
             mesh.point_data[field_name] = displacement
+
+        # Add plastic strain fields (if available)
+        if data.filtered_plastic_strain is not None:
+            # Add timestep-based fields for full temporal data
+            for t in range(n_timesteps):
+                time_value = t * self.time_step
+                time_str = f"t{time_value:.3f}"
+                field_name = f"plastic_strain_{time_str}"
+                mesh.point_data[field_name] = data.filtered_plastic_strain[t, :]
+
+            # Also add a single field with the FINAL timestep for easy visualization
+            mesh.point_data["plastic_strain"] = data.filtered_plastic_strain[-1, :]
+
+            self.logger.info(
+                f"Added plastic_strain fields for {n_timesteps} timesteps "
+                f"(range: [{data.filtered_plastic_strain.min():.6f}, {data.filtered_plastic_strain.max():.6f}])"
+            )
+        else:
+            self.logger.info("Plastic strain not available - skipping")
+
+        # Add von Mises stress fields (if available)
+        if data.filtered_von_mises_stress is not None:
+            # Add timestep-based fields for full temporal data
+            for t in range(n_timesteps):
+                time_value = t * self.time_step
+                time_str = f"t{time_value:.3f}"
+                field_name = f"von_mises_stress_{time_str}"
+                mesh.point_data[field_name] = data.filtered_von_mises_stress[t, :]
+
+            # Also add a single field with the FINAL timestep for easy visualization
+            mesh.point_data["von_mises_stress"] = data.filtered_von_mises_stress[-1, :]
+
+            self.logger.info(
+                f"Added von_mises_stress fields for {n_timesteps} timesteps "
+                f"(range: [{data.filtered_von_mises_stress.min():.2f}, {data.filtered_von_mises_stress.max():.2f}] MPa)"
+            )
+        else:
+            self.logger.info("Von Mises stress not available - skipping")
 
         # Add boundary conditions as field data (global metadata)
         if data.metadata.boundary_conditions:
@@ -573,6 +636,46 @@ class CrashZarrDataSource(DataSource):
             chunks=edges_chunks,
             compressors=(self.compressor,),
         )
+
+        # Write plastic strain if available
+        if data.filtered_plastic_strain is not None:
+            plastic_strain_data = data.filtered_plastic_strain.astype(np.float32)
+            plastic_strain_chunks = self._calculate_chunks(plastic_strain_data)
+            root.create_array(
+                name="plastic_strain",
+                data=plastic_strain_data,
+                chunks=plastic_strain_chunks,
+                compressors=(self.compressor,),
+            )
+            root.attrs["plastic_strain_min"] = float(np.min(plastic_strain_data))
+            root.attrs["plastic_strain_max"] = float(np.max(plastic_strain_data))
+            root.attrs["plastic_strain_mean"] = float(np.mean(plastic_strain_data))
+            self.logger.info(
+                f"Added plastic_strain array: {plastic_strain_data.shape} "
+                f"(range: [{np.min(plastic_strain_data):.6f}, {np.max(plastic_strain_data):.6f}])"
+            )
+        else:
+            self.logger.info("Plastic strain not available - skipping")
+
+        # Write von Mises stress if available
+        if data.filtered_von_mises_stress is not None:
+            stress_data = data.filtered_von_mises_stress.astype(np.float32)
+            stress_chunks = self._calculate_chunks(stress_data)
+            root.create_array(
+                name="von_mises_stress",
+                data=stress_data,
+                chunks=stress_chunks,
+                compressors=(self.compressor,),
+            )
+            root.attrs["von_mises_stress_min"] = float(np.min(stress_data))
+            root.attrs["von_mises_stress_max"] = float(np.max(stress_data))
+            root.attrs["von_mises_stress_mean"] = float(np.mean(stress_data))
+            self.logger.info(
+                f"Added von_mises_stress array: {stress_data.shape} "
+                f"(range: [{np.min(stress_data):.2f}, {np.max(stress_data):.2f}] MPa)"
+            )
+        else:
+            self.logger.info("Von Mises stress not available - skipping")
 
         # Add some statistics as metadata
         root.attrs["thickness_min"] = float(np.min(data.filtered_node_thickness))

@@ -89,6 +89,21 @@ class CrashDataTransformation(DataTransformation):
         filtered_pos_raw = data.pos_raw[:, keep_nodes, :]
         filtered_node_thickness = data.node_thickness[keep_nodes]
 
+        # Filter plastic strain and stress if available
+        filtered_plastic_strain = None
+        if data.node_plastic_strain is not None:
+            filtered_plastic_strain = data.node_plastic_strain[:, keep_nodes]
+            self.logger.info(
+                f"Filtered plastic strain: {filtered_plastic_strain.shape}"
+            )
+
+        filtered_von_mises_stress = None
+        if data.node_von_mises_stress is not None:
+            filtered_von_mises_stress = data.node_von_mises_stress[:, keep_nodes]
+            self.logger.info(
+                f"Filtered von Mises stress: {filtered_von_mises_stress.shape}"
+            )
+
         # Step 3: Remap mesh connectivity
         filtered_mesh_connectivity = []
         for cell in data.mesh_connectivity:
@@ -117,6 +132,11 @@ class CrashDataTransformation(DataTransformation):
                 remap2 = {old_idx: new_idx for new_idx, old_idx in enumerate(keep2)}
                 filtered_pos_raw = filtered_pos_raw[:, keep2, :]
                 filtered_node_thickness = filtered_node_thickness[keep2]
+                # Compact plastic strain and stress if available
+                if filtered_plastic_strain is not None:
+                    filtered_plastic_strain = filtered_plastic_strain[:, keep2]
+                if filtered_von_mises_stress is not None:
+                    filtered_von_mises_stress = filtered_von_mises_stress[:, keep2]
                 filtered_mesh_connectivity = [
                     [remap2[n] for n in cell] for cell in filtered_mesh_connectivity
                 ]
@@ -134,11 +154,15 @@ class CrashDataTransformation(DataTransformation):
         data.pos_raw = None
         data.mesh_connectivity = None
         data.node_thickness = None
+        data.node_plastic_strain = None
+        data.node_von_mises_stress = None
 
         return CrashExtractedDataInMemory(
             metadata=data.metadata,
             filtered_pos_raw=filtered_pos_raw,
             filtered_mesh_connectivity=filtered_mesh_connectivity,
             filtered_node_thickness=filtered_node_thickness,
+            filtered_plastic_strain=filtered_plastic_strain,
+            filtered_von_mises_stress=filtered_von_mises_stress,
             edges=edges,
         )

@@ -15,7 +15,7 @@
 # limitations under the License.
 
 from pathlib import Path
-from typing import Optional, Dict
+from typing import Optional
 
 import numpy as np
 from lasso.dyna import ArrayType, D3plot
@@ -56,9 +56,151 @@ def build_edges_from_mesh_connectivity(mesh_connectivity) -> set:
     return edges
 
 
+def compute_von_mises_stress(stress_tensor: np.ndarray) -> np.ndarray:
+    """Calculate Von Mises equivalent stress from 6-component stress tensor.
+
+    Handles various shapes from d3plot files:
+    - (timesteps, num_elements, 6)
+    - (timesteps, num_elements, integration_points, 6)
+    - (timesteps, num_elements, layers, integration_points, 6)
+
+    For multi-point data, averages over integration points/layers.
+
+    Args:
+        stress_tensor: Stress tensor with last dimension = 6
+                      Components: [Sxx, Syy, Szz, Sxy, Syz, Szx]
+
+    Returns:
+        Von Mises stress: Shape (timesteps, num_elements)
+    """
+    # If we have extra dimensions (integration points, layers), average them first
+    # Keep first two dims (timesteps, elements) and last dim (6 components)
+    while stress_tensor.ndim > 3:
+        # Average over the 3rd dimension (integration points or layers)
+        stress_tensor = np.mean(stress_tensor, axis=2)
+
+    # Extract stress components
+    sxx = stress_tensor[..., 0]
+    syy = stress_tensor[..., 1]
+    szz = stress_tensor[..., 2]
+    sxy = stress_tensor[..., 3]
+    syz = stress_tensor[..., 4]
+    szx = stress_tensor[..., 5]
+
+    # Von Mises formula: sqrt(0.5*[(σx-σy)² + (σy-σz)² + (σz-σx)²] + 3*(τxy² + τyz² + τzx²))
+    von_mises = np.sqrt(
+        0.5 * ((sxx - syy) ** 2 + (syy - szz) ** 2 + (szz - sxx) ** 2)
+        + 3 * (sxy**2 + syz**2 + szx**2)
+    )
+    return von_mises
+
+
+def compute_node_field_from_elements(
+    element_data: np.ndarray,
+    mesh_connectivity: np.ndarray,
+    num_nodes: int,
+) -> np.ndarray:
+    """Map element-centered data to nodes via weighted averaging.
+
+    Each node's value is the average of all connected elements.
+    Handles both 0-based and 1-based indexing in mesh_connectivity.
+    Uses the exact same indexing pattern as compute_node_thickness.
+
+    Args:
+        element_data: Shape (timesteps, num_elements) or (num_elements,)
+        mesh_connectivity: Element connectivity array (may be 0-based or 1-based)
+        num_nodes: Total number of nodes
+
+    Returns:
+        node_data: Shape (timesteps, num_nodes) or (num_nodes,)
+    """
+    is_temporal = element_data.ndim == 2
+
+    if is_temporal:
+        # For temporal data, process each timestep independently
+        num_timesteps = element_data.shape[0]
+        node_field_all_timesteps = np.zeros(
+            (num_timesteps, num_nodes), dtype=np.float64
+        )
+
+        for t in range(num_timesteps):
+            # Extract data for this timestep: shape (num_elements,)
+            element_data_t = element_data[t, :]
+
+            # Use the exact same logic as compute_node_thickness
+            node_field_sum = np.zeros(num_nodes)
+            node_field_count = np.zeros(num_nodes)
+
+            # Detect indexing offset (1-based vs 0-based)
+            conn_min = np.min(mesh_connectivity)
+            conn_max = np.max(mesh_connectivity)
+
+            offset = 0
+            if conn_max >= num_nodes:
+                if conn_min >= 1:
+                    offset = -1
+
+            # Accumulate values - EXACT pattern from compute_node_thickness
+            for i, element in enumerate(mesh_connectivity):
+                field_value = element_data_t[i]
+                for node_idx in element:
+                    # Apply offset (fix 1-based)
+                    idx = int(node_idx + offset)
+
+                    # Boundary check - ignore nodes that don't exist in coords
+                    if 0 <= idx < num_nodes:
+                        node_field_sum[idx] += field_value
+                        node_field_count[idx] += 1
+
+            # Average
+            mask = node_field_count > 0
+            node_field_sum[mask] /= node_field_count[mask]
+
+            node_field_all_timesteps[t, :] = node_field_sum
+
+        return node_field_all_timesteps
+    else:
+        # For static data, use the exact same logic as compute_node_thickness
+        node_field_sum = np.zeros(num_nodes)
+        node_field_count = np.zeros(num_nodes)
+
+        # Detect indexing offset (1-based vs 0-based)
+        conn_min = np.min(mesh_connectivity)
+        conn_max = np.max(mesh_connectivity)
+
+        offset = 0
+        if conn_max >= num_nodes:
+            if conn_min >= 1:
+                offset = -1
+
+        # Accumulate values - EXACT pattern from compute_node_thickness
+        for i, element in enumerate(mesh_connectivity):
+            field_value = element_data[i]
+            for node_idx in element:
+                # Apply offset (fix 1-based)
+                idx = int(node_idx + offset)
+
+                # Boundary check - ignore nodes that don't exist in coords
+                if 0 <= idx < num_nodes:
+                    node_field_sum[idx] += field_value
+                    node_field_count[idx] += 1
+
+        # Average
+        mask = node_field_count > 0
+        node_field_sum[mask] /= node_field_count[mask]
+
+        return node_field_sum
+
+
 def load_d3plot_data(data_path: str):
-    """Load node coordinates and displacements from a d3plot file."""
-    # Note: OpenRadioss simulations often output to D3PLOT format. 
+    """Load node coordinates, displacements, and material response data from d3plot.
+
+    Returns:
+        Tuple of (coords, pos_raw, mesh_connectivity, part_ids, actual_part_ids,
+                  plastic_strain, von_mises_stress)
+        where plastic_strain and von_mises_stress are node-mapped and may be None.
+    """
+    # Note: OpenRadioss simulations often output to D3PLOT format.
     # This function assumes the result file is a valid d3plot.
     dp = D3plot(data_path)
     coords = dp.arrays[ArrayType.node_coordinates]  # (num_nodes, 3)
@@ -71,7 +213,46 @@ def load_d3plot_data(data_path: str):
     if ArrayType.part_ids in dp.arrays:
         actual_part_ids = dp.arrays[ArrayType.part_ids]
 
-    return coords, pos_raw, mesh_connectivity, part_ids, actual_part_ids
+    num_nodes = coords.shape[0]
+
+    # Extract and map plastic strain (element → node)
+    plastic_strain_node = None
+    if ArrayType.element_shell_effective_plastic_strain in dp.arrays:
+        plastic_strain_elem = dp.arrays[
+            ArrayType.element_shell_effective_plastic_strain
+        ]
+
+        # Handle integration points: average over extra dimensions to get (timesteps, num_elements)
+        while plastic_strain_elem.ndim > 2:
+            plastic_strain_elem = np.mean(plastic_strain_elem, axis=2)
+
+        plastic_strain_node = compute_node_field_from_elements(
+            plastic_strain_elem, mesh_connectivity, num_nodes
+        )
+
+    # Extract and map von Mises stress (element → node)
+    von_mises_stress_node = None
+    if ArrayType.element_shell_stress in dp.arrays:
+        stress_tensor_elem = dp.arrays[ArrayType.element_shell_stress]
+        von_mises_elem = compute_von_mises_stress(stress_tensor_elem)
+
+        # Ensure we have shape (timesteps, num_elements) after von Mises calculation
+        while von_mises_elem.ndim > 2:
+            von_mises_elem = np.mean(von_mises_elem, axis=2)
+
+        von_mises_stress_node = compute_node_field_from_elements(
+            von_mises_elem, mesh_connectivity, num_nodes
+        )
+
+    return (
+        coords,
+        pos_raw,
+        mesh_connectivity,
+        part_ids,
+        actual_part_ids,
+        plastic_strain_node,
+        von_mises_stress_node,
+    )
 
 
 def find_k_file(run_dir: Path) -> Optional[Path]:
@@ -82,7 +263,7 @@ def find_k_file(run_dir: Path) -> Optional[Path]:
 
 def find_rad_file(run_dir: Path) -> Optional[Path]:
     """Find OpenRadioss starter file (*0000.rad) in run directory.
-    
+
     Args:
         run_dir: Path to run directory.
 
@@ -92,6 +273,7 @@ def find_rad_file(run_dir: Path) -> Optional[Path]:
     # OpenRadioss starter files usually end in 0000.rad
     rad_files = list(run_dir.glob("*0000.rad"))
     return rad_files[0] if rad_files else None
+
 
 def parse_k_file(k_file_path: Path) -> dict[int, float]:
     """Parse LS-DYNA .k file to extract part thickness information.
@@ -177,6 +359,7 @@ def parse_k_file(k_file_path: Path) -> dict[int, float]:
     }
     return part_thickness
 
+
 def parse_rad_file(rad_file_path: Path) -> dict[int, float]:
     """Parse OpenRadioss .rad file to extract part thickness information.
 
@@ -191,19 +374,19 @@ def parse_rad_file(rad_file_path: Path) -> dict[int, float]:
     i = 0
     while i < len(lines):
         line = lines[i]
-        
+
         # --- Parse Parts ---
         if line.startswith("/PART/"):
             try:
                 parts = line.split("/")
                 if len(parts) >= 3 and parts[2].isdigit():
                     part_id = int(parts[2])
-                    
+
                     # Usually:
                     # i   : /PART/13
                     # i+1 : Title (Skip)
                     # i+2 : Data (PropID is 1st token)
-                    
+
                     data_line_idx = i + 2
                     if data_line_idx < len(lines):
                         tokens = lines[data_line_idx].split()
@@ -221,31 +404,31 @@ def parse_rad_file(rad_file_path: Path) -> dict[int, float]:
                 parts = line.split("/")
                 if len(parts) >= 4 and parts[3].isdigit():
                     prop_id = int(parts[3])
-                    
+
                     # Structure:
                     # i   : /PROP/SHELL/1
                     # i+1 : Title (e.g., "Prop_DP600") -> SKIP THIS
                     # i+2 : Data Line 1 (Ishell...)
                     # i+3 : Data Line 2 (hm...)
                     # i+4 : Data Line 3 (Thick is at index 2)
-                    
-                    current_idx = i + 2 # Start looking AFTER the title
+
+                    current_idx = i + 2  # Start looking AFTER the title
                     data_lines_found = 0
-                    
+
                     while current_idx < len(lines) and data_lines_found < 3:
                         curr_line = lines[current_idx]
-                        
+
                         # Stop if we hit a new keyword
                         if curr_line.startswith("/"):
                             break
-                            
+
                         # Skip comments and empty lines
                         if not curr_line or curr_line.startswith("#"):
                             current_idx += 1
                             continue
-                        
+
                         data_lines_found += 1
-                        
+
                         # Thickness is on the 3rd valid data line
                         if data_lines_found == 3:
                             tokens = curr_line.split()
@@ -272,7 +455,7 @@ def parse_rad_file(rad_file_path: Path) -> dict[int, float]:
         else:
             # If property not found, default to 0.0 or log warning if needed
             part_thickness[pid] = 0.0
-            
+
     return part_thickness
 
 
@@ -296,9 +479,7 @@ def compute_node_thickness(
     # 1. Resolve Part IDs
     if actual_part_ids is not None:
         # Skip index 0 in actual_part_ids as it's often a placeholder in d3plot arrays
-        part_index_to_id = {
-            i: pid for i, pid in enumerate(actual_part_ids) if i > 0
-        }
+        part_index_to_id = {i: pid for i, pid in enumerate(actual_part_ids) if i > 0}
     else:
         # Fallback if no actual mapping exists
         sorted_part_ids = sorted(part_thickness_map.keys())
@@ -328,16 +509,16 @@ def compute_node_thickness(
     # or if min index is 1, it's likely 1-based.
     conn_min = np.min(mesh_connectivity)
     conn_max = np.max(mesh_connectivity)
-    
+
     offset = 0
     if conn_max >= num_nodes:
         if conn_min >= 1:
             # Shift down by 1
-            offset = -1 
+            offset = -1
         else:
-            # Hybrid/Error state: indices are out of bounds but start at 0. 
+            # Hybrid/Error state: indices are out of bounds but start at 0.
             # We must clip to avoid crashing.
-            pass 
+            pass
 
     # 4. Accumulate Thickness
     # We iterate carefully to avoid crashing on bad indices
@@ -346,7 +527,7 @@ def compute_node_thickness(
         for node_idx in element:
             # Apply offset (fix 1-based)
             idx = int(node_idx + offset)
-            
+
             # Boundary check - ignore nodes that don't exist in coords
             if 0 <= idx < num_nodes:
                 node_thickness[idx] += thick
